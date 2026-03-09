@@ -95,16 +95,17 @@ def load_bin_database() -> dict[str, dict[str, Any]]:
 
         table = pacsv.read_csv(BIN_DATABASE_PATH)
         df = table.to_pandas(types_mapper=pd.ArrowDtype).fillna("")
+        df.columns = [str(c).strip().lower() for c in df.columns]
 
         db: dict[str, dict[str, Any]] = {}
         for row in df.to_dict(orient="records"):
             key = _sanitize(row.get("bin", ""))[:6]
             if key:
                 db[key] = {
-                    "bank": row.get("bank", ""),
+                    "bank": row.get("bank", row.get("issuer", "")),
                     "brand": row.get("brand", ""),
                     "type": row.get("type", ""),
-                    "country": row.get("country", ""),
+                    "country": row.get("country", row.get("countryname", row.get("isocode2", ""))),
                 }
 
         _LOCAL_BIN_DB = db
