@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Diagnóstico de métodos de pago para Braintree Sandbox.
-
-Requisitos:
-- Variables de entorno: BRAINTREE_MERCHANT_ID, BRAINTREE_PUBLIC_KEY, BRAINTREE_PRIVATE_KEY
-- Archivo local de BIN: bin-database.csv
-"""
+"""Diagnóstico robusto de métodos de pago con Braintree Sandbox."""
 
 from __future__ import annotations
 
@@ -17,10 +12,10 @@ import braintree
 import pandas as pd
 
 PROCESSOR_CODE_MESSAGES = {
-    "2000": "Do Not Honor: el banco emisor rechazó la transacción.",
+    "2000": "Do Not Honor: el banco emisor rechazó la operación.",
     "2001": "Insufficient Funds: fondos insuficientes.",
     "2004": "Expired Card: la tarjeta está expirada.",
-    "2005": "Invalid Credit Card Number: número de tarjeta inválido.",
+    "2005": "Invalid Credit Card Number: número inválido.",
     "2010": "CVV verification failed: CVV inválido.",
     "2015": "Transaction not allowed: no permitido por el emisor.",
     "2038": "Processor declined: rechazo general del procesador.",
@@ -36,20 +31,19 @@ class CardPayload:
 
 
 def _read_card_attr(card: Any, name: str) -> str:
-    value = getattr(card, name, "")
-    return str(value).strip()
+    return str(getattr(card, name, "")).strip()
 
 
 def _clean_digits(value: str) -> str:
     return "".join(ch for ch in value if ch.isdigit())
 
 
-def load_bin_dataframe(bin_database_path: str = "bin-database.csv") -> pd.DataFrame:
+def load_bin_dataframe(bin_database_path: str = "templates/bin-database.csv") -> pd.DataFrame:
     df = pd.read_csv(bin_database_path, dtype=str, keep_default_na=False)
     df.columns = [str(c).strip().lower() for c in df.columns]
 
     if "bin" not in df.columns:
-        raise ValueError("El archivo bin-database.csv debe incluir la columna 'bin'.")
+        raise ValueError("La base local debe incluir la columna 'bin'.")
 
     df["bin"] = df["bin"].astype(str).str.replace(r"\D", "", regex=True).str.slice(0, 6)
     df = df[df["bin"].str.len() == 6]
@@ -59,18 +53,14 @@ def load_bin_dataframe(bin_database_path: str = "bin-database.csv") -> pd.DataFr
 def lookup_issuer(df: pd.DataFrame, card_number: str) -> dict[str, str]:
     bin6 = _clean_digits(card_number)[:6]
     if not bin6:
-        return {"bin": "", "bank": "UNKNOWN", "type": "UNKNOWN"}
+        return {"bin": "", "bank": "UNKNOWN"}
 
     matched = df[df["bin"] == bin6]
     if matched.empty:
-        return {"bin": bin6, "bank": "UNKNOWN", "type": "UNKNOWN"}
+        return {"bin": bin6, "bank": "UNKNOWN"}
 
     row = matched.iloc[0].to_dict()
-    return {
-        "bin": bin6,
-        "bank": str(row.get("bank") or row.get("issuer") or "UNKNOWN"),
-        "type": str(row.get("type") or "UNKNOWN"),
-    }
+    return {"bin": bin6, "bank": str(row.get("bank") or row.get("issuer") or "UNKNOWN")}
 
 
 def _build_gateway() -> braintree.BraintreeGateway:
@@ -94,8 +84,20 @@ def _build_gateway() -> braintree.BraintreeGateway:
     )
 
 
-def verify_payment_method_diagnostics(card: Any, bin_database_path: str = "bin-database.csv") -> dict[str, Any]:
-    """Verifica tarjeta en Braintree Vault y devuelve diagnóstico JSON-serializable."""
+def _diagnostic_message(processor_code: Any, processor_text: Any) -> str:
+    if processor_code is not None:
+        mapped = PROCESSOR_CODE_MESSAGES.get(str(processor_code))
+        if mapped:
+            return mapped
+    return str(processor_text or "No fue posible obtener detalle técnico del procesador.")
+
+
+def diagnose_payment_method_status(card: Any, bin_database_path: str = "templates/bin-database.csv") -> dict[str, Any]:
+    """Ejecuta diagnóstico profundo del estado de verificación de tarjeta en Braintree.
+
+    COMPLIANT: solo cuando verification.status == 'verified'.
+    NON_COMPLIANT: cualquier otro estado (processor_declined, gateway_rejected, failed, etc).
+    """
     payload = CardPayload(
         number=_clean_digits(_read_card_attr(card, "number")),
         month=_clean_digits(_read_card_attr(card, "month")),
@@ -103,25 +105,23 @@ def verify_payment_method_diagnostics(card: Any, bin_database_path: str = "bin-d
         cvv=_clean_digits(_read_card_attr(card, "cvv")),
     )
 
-    issuer_details = {"bin": "", "bank": "UNKNOWN", "type": "UNKNOWN"}
+    issuer = {"bin": "", "bank": "UNKNOWN"}
     try:
-        bin_df = load_bin_dataframe(bin_database_path)
-        issuer_details = lookup_issuer(bin_df, payload.number)
+        issuer = lookup_issuer(load_bin_dataframe(bin_database_path), payload.number)
     except Exception as exc:
-        issuer_details["lookup_error"] = str(exc)
+        issuer = {"bin": _clean_digits(payload.number)[:6], "bank": "UNKNOWN", "lookup_error": str(exc)}
 
     if not payload.number or not payload.month or not payload.year or not payload.cvv:
         return {
-            "status": "error",
-            "verified": False,
-            "message": "Payload de tarjeta incompleto.",
+            "status": "NON_COMPLIANT",
+            "verification_status": None,
+            "message": "Payload incompleto para diagnóstico.",
             "processor_response_code": None,
-            "issuer": issuer_details,
+            "issuer": issuer,
         }
 
     try:
         gateway = _build_gateway()
-
         result = gateway.credit_card.create(
             {
                 "customer_id": "diagnostics_customer",
@@ -129,89 +129,88 @@ def verify_payment_method_diagnostics(card: Any, bin_database_path: str = "bin-d
                 "expiration_month": payload.month,
                 "expiration_year": payload.year,
                 "cvv": payload.cvv,
-                "options": {
-                    "verify_card": True,
-                },
+                "options": {"verify_card": True},
             }
         )
 
-        if result.is_success:
+        verification = None
+        if getattr(result, "credit_card", None):
+            verification = getattr(result.credit_card, "verification", None)
+        if verification is None:
+            verification = getattr(result, "credit_card_verification", None)
+
+        if verification is None:
+            validation_errors = []
+            if getattr(result, "errors", None):
+                validation_errors = [
+                    {"attribute": e.attribute, "code": e.code, "message": e.message}
+                    for e in result.errors.deep_errors
+                ]
             return {
-                "status": "success",
-                "verified": True,
-                "message": "Método de pago verificado correctamente en Sandbox.",
+                "status": "NON_COMPLIANT",
+                "verification_status": None,
+                "message": "Sin objeto verification en respuesta de Braintree.",
                 "processor_response_code": None,
-                "issuer": issuer_details,
+                "validation_errors": validation_errors,
+                "issuer": issuer,
             }
 
-        credit_card_verification = getattr(result, "credit_card_verification", None)
-        processor_code = getattr(credit_card_verification, "processor_response_code", None)
-        processor_text = getattr(credit_card_verification, "processor_response_text", None)
+        verification_status = str(getattr(verification, "status", "")).lower()
+        processor_code = getattr(verification, "processor_response_code", None)
+        processor_text = getattr(verification, "processor_response_text", None)
 
-        human_message = PROCESSOR_CODE_MESSAGES.get(
-            str(processor_code),
-            processor_text or "Verificación fallida por el procesador.",
-        )
-
-        validation_errors = []
-        if getattr(result, "errors", None):
-            validation_errors = [
-                {
-                    "attribute": err.attribute,
-                    "code": err.code,
-                    "message": err.message,
-                }
-                for err in result.errors.deep_errors
-            ]
-
+        compliant = verification_status == "verified"
         return {
-            "status": "declined",
-            "verified": False,
-            "message": human_message,
+            "status": "COMPLIANT" if compliant else "NON_COMPLIANT",
+            "verification_status": verification_status,
+            "message": "Verificación aprobada por Sandbox." if compliant else _diagnostic_message(processor_code, processor_text),
             "processor_response_code": processor_code,
             "processor_response_text": processor_text,
-            "validation_errors": validation_errors,
-            "issuer": issuer_details,
+            "issuer": issuer,
         }
 
     except braintree.exceptions.AuthorizationError as exc:
         return {
-            "status": "error",
-            "verified": False,
-            "message": "Error de autorización con Braintree.",
+            "status": "NON_COMPLIANT",
+            "verification_status": None,
+            "message": "Error de autorización contra Braintree Sandbox.",
             "processor_response_code": None,
             "details": str(exc),
-            "issuer": issuer_details,
+            "issuer": issuer,
         }
     except braintree.exceptions.ServerError as exc:
         return {
-            "status": "error",
-            "verified": False,
-            "message": "Error interno del servidor Braintree.",
+            "status": "NON_COMPLIANT",
+            "verification_status": None,
+            "message": "Error del servidor Braintree.",
             "processor_response_code": None,
             "details": str(exc),
-            "issuer": issuer_details,
+            "issuer": issuer,
         }
     except EnvironmentError as exc:
         return {
-            "status": "error",
-            "verified": False,
+            "status": "NON_COMPLIANT",
+            "verification_status": None,
             "message": str(exc),
             "processor_response_code": None,
-            "issuer": issuer_details,
+            "issuer": issuer,
         }
-    except Exception as exc:  # fallback de red/parsing/SDK
+    except Exception as exc:
         return {
-            "status": "error",
-            "verified": False,
-            "message": "Error inesperado durante diagnóstico de pago.",
+            "status": "NON_COMPLIANT",
+            "verification_status": None,
+            "message": "Fallo inesperado durante diagnóstico.",
             "processor_response_code": None,
             "details": str(exc),
-            "issuer": issuer_details,
+            "issuer": issuer,
         }
+
+
+def verify_payment_method_diagnostics(card: Any, bin_database_path: str = "templates/bin-database.csv") -> dict[str, Any]:
+    """Wrapper backward-compatible."""
+    return diagnose_payment_method_status(card, bin_database_path)
 
 
 if __name__ == "__main__":
-    sample_card = CardPayload(number="4111111111111111", month="12", year="2030", cvv="123")
-    response = verify_payment_method_diagnostics(sample_card)
-    print(json.dumps(response, indent=2, ensure_ascii=False))
+    sample = CardPayload(number="4111111111111111", month="12", year="2030", cvv="123")
+    print(json.dumps(diagnose_payment_method_status(sample), ensure_ascii=False, indent=2))
