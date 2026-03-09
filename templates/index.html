@@ -98,6 +98,19 @@
       }
     }
 
+
+    function clearResults() {
+      currentValid = [];
+      currentInvalid = [];
+      validTable.innerHTML = '';
+      invalidList.innerHTML = '';
+      document.getElementById('validBadge').textContent = '0';
+      document.getElementById('invalidBadge').textContent = '0';
+      document.getElementById('totalCount').textContent = '0';
+      document.getElementById('validCount').textContent = '0';
+      document.getElementById('invalidCount').textContent = '0';
+    }
+
     function copyable(value, className = '') {
       const show = value || '(vacío)';
       return `<button class="font-mono hover:underline ${className}" data-copy="${value || ''}">${show}</button>`;
@@ -143,6 +156,7 @@
       const rawInput = document.getElementById('recordsInput').value;
       const records = rawInput.split('\n').filter(v => v.trim().length);
 
+      clearResults();
       appendLog(`Enviando ${records.length} registros`, 'info');
       try {
         const response = await fetch('/api/process', {
