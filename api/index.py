@@ -1,238 +1,210 @@
 import os
-import re
-import threading
+from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
+from uuid import uuid4
 
+import braintree
 import pandas as pd
-import pyarrow.csv as pacsv
-import requests
 from flask import Flask, jsonify, render_template, request
 
 app = Flask(__name__, template_folder="../templates")
 app.config["JSON_SORT_KEYS"] = False
 
-BIN_DATABASE_PATH = os.getenv("BIN_DATABASE_PATH", "templates/bin_database.csv")
-VALIDATION_TIMEOUT = float(os.getenv("VALIDATION_TIMEOUT", "12"))
-MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "200000"))
-PUBLIC_BIN_API = os.getenv("PUBLIC_BIN_API", "https://lookup.binlist.net")
-
-BIN_WEB_CACHE: dict[str, dict[str, Any]] = {}
-BIN_WEB_CACHE_LOCK = threading.Lock()
-_LOCAL_BIN_DB: dict[str, dict[str, Any]] | None = None
-
-LINE_PATTERN = re.compile(
-    r"^\s*(?P<number>\d{15,16})\D+(?P<month>0[1-9]|1[0-2])\D+(?P<year>\d{2}|\d{4})\D+(?P<cvv>\d{3,4})\s*$"
-)
+BIN_DB_PATH = os.getenv("BIN_DB_PATH", "templates/bin-database.csv")
+PROCESSOR_CODE_MESSAGES = {
+    "2000": "Do Not Honor: el banco emisor rechazó la operación.",
+    "2001": "Insufficient Funds: fondos insuficientes.",
+    "2004": "Expired Card: la tarjeta está expirada.",
+    "2005": "Invalid Credit Card Number: número inválido.",
+    "2010": "CVV verification failed: CVV inválido.",
+    "2015": "Transaction not allowed: no permitido por el emisor.",
+    "2038": "Processor declined: rechazo general del procesador.",
+}
 
 
-def _sanitize(value: Any) -> str:
-    return "".join(ch for ch in str(value).strip() if ch.isdigit())
+@dataclass(slots=True)
+class CardPayload:
+    identifier: str
+    number: str
+    month: str
+    year: str
+    cvv: str
 
 
-def _to_yy(year: str) -> str:
-    return year[-2:]
+def _clean_digits(value: str) -> str:
+    return "".join(ch for ch in str(value) if ch.isdigit())
 
 
-def validate_luhn(number: str) -> bool:
-    cleaned = _sanitize(number)
-    if len(cleaned) < 15 or len(cleaned) > 16:
-        return False
-
-    total = 0
-    reverse_digits = cleaned[::-1]
-
-    for idx, char in enumerate(reverse_digits):
-        digit = int(char)
-        if idx % 2 == 1:
-            digit *= 2
-            if digit > 9:
-                digit -= 9
-        total += digit
-
-    return total % 10 == 0
+def _normalize_year(year: str) -> str:
+    digits = _clean_digits(year)
+    if len(digits) == 2:
+        return f"20{digits}"
+    return digits
 
 
-def parse_line(raw: Any) -> dict[str, Any] | None:
-    text = str(raw).strip()
-    match = LINE_PATTERN.fullmatch(text)
-    if not match:
-        return None
-
-    number = match.group("number")
-    month = match.group("month")
-    year = _to_yy(match.group("year"))
-    cvv = match.group("cvv")
-
-    return {
-        "input": text,
-        "number": number,
-        "month": month,
-        "year": year,
-        "cvv": cvv,
-        "formatted": f"{number}|{month}|{year}|{cvv}",
-    }
+def _normalize_month(month: str) -> str:
+    digits = _clean_digits(month)
+    if not digits:
+        return ""
+    if len(digits) == 1:
+        digits = f"0{digits}"
+    return digits
 
 
-def _normalize_enrichment(entry: dict[str, Any], source: str) -> dict[str, Any]:
-    return {
-        "source": source,
-        "bank": str(entry.get("bank") or "N/A"),
-        "brand": str(entry.get("brand") or "N/A"),
-        "type": str(entry.get("type") or "N/A"),
-        "country": str(entry.get("country") or "N/A"),
-    }
-
-
-def load_bin_database() -> dict[str, dict[str, Any]]:
-    global _LOCAL_BIN_DB
-    if _LOCAL_BIN_DB is not None:
-        return _LOCAL_BIN_DB
-
+@lru_cache(maxsize=1)
+def _load_bin_df() -> pd.DataFrame:
     try:
-        if not os.path.exists(BIN_DATABASE_PATH):
-            _LOCAL_BIN_DB = {}
-            return _LOCAL_BIN_DB
-
-        table = pacsv.read_csv(BIN_DATABASE_PATH)
-        df = table.to_pandas(types_mapper=pd.ArrowDtype).fillna("")
-        df.columns = [str(c).strip().lower() for c in df.columns]
-
-        db: dict[str, dict[str, Any]] = {}
-        for row in df.to_dict(orient="records"):
-            key = _sanitize(row.get("bin", ""))[:6]
-            if key:
-                db[key] = {
-                    "bank": row.get("bank", row.get("issuer", "")),
-                    "brand": row.get("brand", ""),
-                    "type": row.get("type", ""),
-                    "country": row.get("country", row.get("countryname", row.get("isocode2", ""))),
-                }
-
-        _LOCAL_BIN_DB = db
-        return _LOCAL_BIN_DB
+        df = pd.read_csv(BIN_DB_PATH, dtype=str, low_memory=False, keep_default_na=False)
     except Exception as exc:
-        app.logger.exception("Failed to load local BIN database: %s", exc)
-        _LOCAL_BIN_DB = {}
-        return _LOCAL_BIN_DB
+        app.logger.warning("No se pudo cargar BIN DB local: %s", exc)
+        return pd.DataFrame(columns=["bin", "bank"])
+
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    if "bin" not in df.columns:
+        df["bin"] = ""
+    if "bank" not in df.columns:
+        df["bank"] = "UNKNOWN"
+
+    df["bin"] = df["bin"].astype(str).str.replace(r"\D", "", regex=True).str.slice(0, 6)
+    return df
 
 
-def fetch_bin_from_web(bin_code: str) -> dict[str, Any]:
-    if not bin_code:
-        return _normalize_enrichment({}, "none")
+def _issuer_from_number(number: str) -> str:
+    bin6 = _clean_digits(number)[:6]
+    if not bin6:
+        return "UNKNOWN"
+    df = _load_bin_df()
+    match = df[df["bin"] == bin6]
+    if match.empty:
+        return "UNKNOWN"
+    return str(match.iloc[0].get("bank", "UNKNOWN")) or "UNKNOWN"
 
-    with BIN_WEB_CACHE_LOCK:
-        if bin_code in BIN_WEB_CACHE:
-            return BIN_WEB_CACHE[bin_code]
 
-    headers = {"Accept-Version": "3", "User-Agent": "wow/7.0"}
-    url = f"{PUBLIC_BIN_API.rstrip('/')}/{bin_code}"
+def _build_gateway() -> braintree.BraintreeGateway:
+    merchant_id = os.getenv("BRAINTREE_MERCHANT_ID", "").strip()
+    public_key = os.getenv("BRAINTREE_PUBLIC_KEY", "").strip()
+    private_key = os.getenv("BRAINTREE_PRIVATE_KEY", "").strip()
+
+    if not merchant_id or not public_key or not private_key:
+        raise EnvironmentError(
+            "Faltan credenciales de Braintree. Define BRAINTREE_MERCHANT_ID, "
+            "BRAINTREE_PUBLIC_KEY y BRAINTREE_PRIVATE_KEY."
+        )
+
+    return braintree.BraintreeGateway(
+        braintree.Configuration(
+            environment=braintree.Environment.Sandbox,
+            merchant_id=merchant_id,
+            public_key=public_key,
+            private_key=private_key,
+        )
+    )
+
+
+def _extract_verification(result: Any) -> Any:
+    verification = None
+    if getattr(result, "credit_card", None):
+        verification = getattr(result.credit_card, "verification", None)
+    if verification is None:
+        verification = getattr(result, "credit_card_verification", None)
+    return verification
+
+
+def diagnose_payment_method_status(card: CardPayload) -> dict[str, Any]:
+    issuer = _issuer_from_number(card.number)
+    month = _normalize_month(card.month)
+    year = _normalize_year(card.year)
+
+    if not card.number or not month or not year or not card.cvv:
+        return {
+            "identifier": card.identifier,
+            "issuer": issuer,
+            "status": "DECLINED",
+            "bank_result": "Payload incompleto",
+            "response_code": None,
+            "verification_status": None,
+        }
 
     try:
-        response = requests.get(url, headers=headers, timeout=VALIDATION_TIMEOUT)
-        response.raise_for_status()
-        payload = response.json()
-        result = _normalize_enrichment(
+        gateway = _build_gateway()
+        customer_result = gateway.customer.create({"id": f"diag_{uuid4().hex[:18]}"})
+        if not customer_result.is_success:
+            raise RuntimeError("No se pudo crear customer temporal para vault verification")
+
+        result = gateway.credit_card.create(
             {
-                "bank": (payload.get("bank") or {}).get("name", "N/A"),
-                "brand": payload.get("scheme", "N/A"),
-                "type": payload.get("type", "N/A"),
-                "country": (payload.get("country") or {}).get("name", "N/A"),
-            },
-            "web",
+                "customer_id": customer_result.customer.id,
+                "number": _clean_digits(card.number),
+                "expiration_month": month,
+                "expiration_year": year,
+                "cvv": _clean_digits(card.cvv),
+                "options": {"verify_card": True},
+            }
         )
-    except requests.Timeout:
-        result = _normalize_enrichment({"bank": "Timeout"}, "web_timeout")
-    except requests.RequestException as exc:
-        result = _normalize_enrichment({"bank": f"Error: {exc}"}, "web_error")
-    except ValueError:
-        result = _normalize_enrichment({"bank": "Invalid JSON"}, "web_error")
 
-    with BIN_WEB_CACHE_LOCK:
-        BIN_WEB_CACHE[bin_code] = result
-    return result
+        verification = _extract_verification(result)
+        if verification is None:
+            return {
+                "identifier": card.identifier,
+                "issuer": issuer,
+                "status": "DECLINED",
+                "bank_result": "Sin objeto verification en respuesta de Braintree.",
+                "response_code": None,
+                "verification_status": None,
+            }
 
+        verification_status = str(getattr(verification, "status", "")).lower()
+        response_code = getattr(verification, "processor_response_code", None)
+        processor_text = getattr(verification, "processor_response_text", None)
 
-def enrich_record(number: str, local_db: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    bin_code = number[:6] if len(number) >= 6 else ""
-    if bin_code and bin_code in local_db:
-        return _normalize_enrichment(local_db[bin_code], "local")
-    if bin_code:
-        return fetch_bin_from_web(bin_code)
-    return _normalize_enrichment({}, "none")
+        if result.is_success and verification_status == "verified":
+            return {
+                "identifier": card.identifier,
+                "issuer": issuer,
+                "status": "APPROVED",
+                "bank_result": processor_text or "verified",
+                "response_code": response_code,
+                "verification_status": verification_status,
+            }
+
+        return {
+            "identifier": card.identifier,
+            "issuer": issuer,
+            "status": "DECLINED",
+            "bank_result": PROCESSOR_CODE_MESSAGES.get(str(response_code), processor_text or verification_status or "declined"),
+            "response_code": response_code,
+            "verification_status": verification_status,
+        }
+
+    except Exception as exc:
+        return {
+            "identifier": card.identifier,
+            "issuer": issuer,
+            "status": "DECLINED",
+            "bank_result": f"Error: {exc}",
+            "response_code": None,
+            "verification_status": None,
+        }
 
 
 @app.get("/")
-def dashboard() -> str:
+def index() -> str:
     return render_template("index.html")
 
 
-@app.post("/api/process")
-def process_batch():
-    try:
-        payload = request.get_json(silent=True) or {}
-        records = payload.get("records", [])
-
-        if isinstance(records, str):
-            records = [line for line in records.splitlines() if line.strip()]
-
-        if not isinstance(records, list):
-            return jsonify({"error": "'records' must be a list or multiline string"}), 400
-
-        if len(records) > MAX_BATCH_SIZE:
-            return jsonify({"error": f"Max batch size is {MAX_BATCH_SIZE}"}), 413
-
-        parsed: list[dict[str, Any]] = []
-        invalid_results: list[dict[str, Any]] = []
-
-        for raw in records:
-            item = parse_line(raw)
-            if item is None:
-                invalid_results.append(
-                    {
-                        "input": str(raw),
-                        "normalized": _sanitize(raw),
-                        "reason": "Formato incompleto. Se requiere NUMERO|MES|AÑO|CVV",
-                        "enrichment": _normalize_enrichment({}, "none"),
-                    }
-                )
-            else:
-                parsed.append(item)
-
-        local_db = load_bin_database()
-        valid_results: list[dict[str, Any]] = []
-
-        for item in parsed:
-            enriched = enrich_record(item["number"], local_db)
-            payload_item = {
-                "input": item["input"],
-                "number": item["number"],
-                "month": item["month"],
-                "year": item["year"],
-                "cvv": item["cvv"],
-                "formatted": item["formatted"],
-                "enrichment": enriched,
-            }
-
-            if validate_luhn(item["number"]):
-                valid_results.append(payload_item)
-            else:
-                invalid_results.append({**payload_item, "reason": "Luhn inválido"})
-
-        return jsonify(
-            {
-                "total": len(records),
-                "valid": len(valid_results),
-                "invalid": len(invalid_results),
-                "valid_results": valid_results,
-                "invalid_results": invalid_results,
-                "cache_size": len(BIN_WEB_CACHE),
-            }
-        )
-    except MemoryError:
-        return jsonify({"error": "Not enough memory for this payload"}), 507
-    except Exception as exc:
-        app.logger.exception("Unexpected processing error: %s", exc)
-        return jsonify({"error": "Internal processing error", "details": str(exc)}), 500
+@app.post("/validate")
+def validate():
+    payload: dict[str, Any] = request.get_json(silent=True) or {}
+    card = CardPayload(
+        identifier=str(payload.get("identifier", "")).strip(),
+        number=str(payload.get("number", "")).strip(),
+        month=str(payload.get("month", "")).strip(),
+        year=str(payload.get("year", "")).strip(),
+        cvv=str(payload.get("cvv", "")).strip(),
+    )
+    result = diagnose_payment_method_status(card)
+    return jsonify(result), 200
 
 
 if __name__ == "__main__":
