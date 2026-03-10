@@ -23,6 +23,15 @@ PROCESSOR_CODE_MESSAGES = {
     "2038": "Processor declined: rechazo general del procesador.",
 }
 
+SANDBOX_ISSUER_HINTS = {
+    "411111": "VISA SANDBOX",
+    "400011": "VISA SANDBOX",
+    "555555": "MASTERCARD SANDBOX",
+    "510510": "MASTERCARD SANDBOX",
+    "378282": "AMEX SANDBOX",
+    "601111": "DISCOVER SANDBOX",
+}
+
 
 @dataclass(slots=True)
 class CardPayload:
@@ -81,8 +90,11 @@ def _issuer_from_number(number: str) -> str:
     df = _load_bin_df()
     match = df[df["bin"] == bin6]
     if match.empty:
-        return "UNKNOWN"
-    return str(match.iloc[0].get("bank", "UNKNOWN")) or "UNKNOWN"
+        return SANDBOX_ISSUER_HINTS.get(bin6, "UNKNOWN")
+    issuer = str(match.iloc[0].get("bank", "UNKNOWN")) or "UNKNOWN"
+    if issuer == "UNKNOWN":
+        issuer = SANDBOX_ISSUER_HINTS.get(bin6, "UNKNOWN")
+    return issuer
 
 
 def _build_gateway() -> braintree.BraintreeGateway:
@@ -134,6 +146,16 @@ def diagnose_payment_method_status(card: CardPayload) -> dict[str, Any]:
             "verification_status": None,
         }
 
+    if len(_clean_digits(card.number)) < 12:
+        return {
+            "identifier": card.identifier,
+            "issuer": issuer,
+            "status": "DECLINED",
+            "bank_result": "Número de tarjeta inválido (longitud insuficiente).",
+            "response_code": "BT_LOCAL_FORMAT",
+            "verification_status": None,
+        }
+
     try:
         gateway = _build_gateway()
         customer_result = gateway.customer.create({"id": f"diag_{uuid4().hex[:18]}"})
@@ -162,18 +184,23 @@ def diagnose_payment_method_status(card: CardPayload) -> dict[str, Any]:
             details = []
             if getattr(result, "errors", None):
                 details = [err.message for err in result.errors.deep_errors]
-            message = "Sin objeto verification en respuesta de Braintree."
-            if details:
-                message = f"{message} {' | '.join(details)}"
-            elif getattr(result, "message", None):
-                message = f"{message} {result.message}"
+
+            raw_message = " | ".join(details) if details else str(getattr(result, "message", "")).strip()
+            if "not an accepted test number" in raw_message.lower():
+                friendly = "Número inválido para Sandbox de Braintree (usa test numbers oficiales)."
+                response_code = "BT_SANDBOX_TEST_NUMBER"
+            else:
+                friendly = raw_message or "Braintree no devolvió objeto de verificación."
+                response_code = "BT_NO_VERIFICATION"
+
             return {
                 "identifier": card.identifier,
                 "issuer": issuer,
                 "status": "DECLINED",
-                "bank_result": message,
-                "response_code": None,
+                "bank_result": friendly,
+                "response_code": response_code,
                 "verification_status": None,
+                "raw_error": raw_message or None,
             }
 
         verification_status = str(getattr(verification, "status", "")).lower()
