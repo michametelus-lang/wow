@@ -3,212 +3,89 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>WOW V7 · Hybrid Engine</title>
+  <title>Braintree Sandbox Monitor</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body class="bg-slate-100 text-slate-900 min-h-screen">
-  <div class="max-w-7xl mx-auto px-4 py-6">
-    <h1 class="text-2xl md:text-3xl font-bold mb-4">WOW V7 · Hybrid Engine & Dual-Copy UI</h1>
+<body class="bg-black text-green-300 font-mono min-h-screen">
+  <div class="max-w-7xl mx-auto p-6">
+    <h1 class="text-2xl mb-4 text-green-400">Payment Monitor Console</h1>
 
-    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-4">
-      <section class="bg-white rounded-2xl shadow p-4">
-        <h2 class="font-semibold text-lg mb-2">Input (Batch)</h2>
-        <textarea id="recordsInput" class="w-full h-80 border rounded-lg p-3 font-mono text-sm" placeholder="Ejemplo: 5154620020996938|06|2032|046"></textarea>
-        <button id="processBtn" class="mt-3 w-full bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 rounded-lg">Analizar</button>
-      </section>
-
-      <section class="bg-white rounded-2xl shadow p-4">
-        <h2 class="font-semibold text-lg mb-2">Monitor</h2>
-        <div class="grid grid-cols-4 gap-2 text-center mb-4">
-          <div class="bg-slate-100 rounded p-2"><div class="text-xs">Total</div><div id="totalCount" class="font-bold">0</div></div>
-          <div class="bg-emerald-100 rounded p-2"><div class="text-xs">Válidos</div><div id="validCount" class="font-bold">0</div></div>
-          <div class="bg-rose-100 rounded p-2"><div class="text-xs">Inválidos</div><div id="invalidCount" class="font-bold">0</div></div>
-          <div class="bg-cyan-100 rounded p-2"><div class="text-xs">Cache Web</div><div id="cacheCount" class="font-bold">0</div></div>
-        </div>
-        <div id="logArea" class="h-80 overflow-auto bg-slate-900 text-slate-100 rounded-lg p-3 font-mono text-xs"></div>
-      </section>
-
-      <section class="bg-white rounded-2xl shadow p-4">
-        <h2 class="font-semibold text-lg mb-2">Acciones rápidas</h2>
-        <div class="space-y-3">
-          <button id="copyValidBtn" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white py-2 rounded-lg">Copiar Válidos</button>
-          <button id="copyInvalidBtn" class="w-full bg-rose-600 hover:bg-rose-700 text-white py-2 rounded-lg">Copiar Inválidos</button>
-          <p class="text-xs text-slate-600">Tip: haz clic en el formato principal para copiarlo individualmente.</p>
-        </div>
-      </section>
+    <div class="bg-zinc-900 border border-green-700 rounded p-4 mb-4">
+      <label class="block mb-2 text-sm text-green-400">Entrada masiva (numero|mes|año|cvv por línea)</label>
+      <textarea id="bulkInput" class="w-full h-48 bg-black border border-green-700 rounded p-3 text-green-200" placeholder="4111111111111111|12|2030|123"></textarea>
+      <button id="runBtn" class="mt-3 px-4 py-2 bg-green-700 hover:bg-green-600 rounded text-black font-bold">Procesar</button>
     </div>
 
-    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-      <section class="bg-white rounded-2xl shadow p-4 border border-emerald-200">
-        <div class="flex items-center justify-between mb-3">
-          <h3 class="font-semibold text-emerald-700">ÉXITOS</h3>
-          <span id="validBadge" class="text-xs px-2 py-1 rounded-full bg-emerald-100 text-emerald-700">0</span>
-        </div>
-        <div class="overflow-auto max-h-[26rem]">
-          <table class="w-full text-sm">
-            <thead class="sticky top-0 bg-emerald-50">
-              <tr>
-                <th class="text-left p-2">Formato Final</th>
-                <th class="text-left p-2">Banco | Marca | Tipo</th>
-              </tr>
-            </thead>
-            <tbody id="validTable"></tbody>
-          </table>
-        </div>
-      </section>
-
-      <section class="bg-white rounded-2xl shadow p-4 border border-rose-200">
-        <div class="flex items-center justify-between mb-3">
-          <h3 class="font-semibold text-rose-700">DESCARTES</h3>
-          <span id="invalidBadge" class="text-xs px-2 py-1 rounded-full bg-rose-100 text-rose-700">0</span>
-        </div>
-        <ul id="invalidList" class="max-h-[26rem] overflow-auto space-y-2 text-sm"></ul>
-      </section>
+    <div class="bg-zinc-900 border border-green-700 rounded p-4 overflow-auto">
+      <table class="w-full text-sm">
+        <thead class="text-green-400 border-b border-green-800">
+          <tr>
+            <th class="text-left p-2">Identificador</th>
+            <th class="text-left p-2">Emisor</th>
+            <th class="text-left p-2">Resultado Bancario</th>
+            <th class="text-left p-2">Código de Respuesta</th>
+          </tr>
+        </thead>
+        <tbody id="resultsBody"></tbody>
+      </table>
     </div>
   </div>
 
   <script>
-    let currentValid = [];
-    let currentInvalid = [];
+    const resultsBody = document.getElementById('resultsBody');
 
-    const logArea = document.getElementById('logArea');
-    const validTable = document.getElementById('validTable');
-    const invalidList = document.getElementById('invalidList');
+    function addRow(data) {
+      const tr = document.createElement('tr');
+      tr.className = 'border-b border-zinc-800';
+      tr.innerHTML = `
+        <td class="p-2">${data.identifier ?? '-'}</td>
+        <td class="p-2">${data.issuer ?? 'UNKNOWN'}</td>
+        <td class="p-2 ${data.status === 'APPROVED' ? 'text-emerald-400' : 'text-red-400'}">${data.bank_result ?? data.status}</td>
+        <td class="p-2">${data.response_code ?? '-'}</td>
+      `;
+      resultsBody.appendChild(tr);
+    }
 
-    function appendLog(message, level = 'info') {
-      const colors = {
-        info: 'text-cyan-300',
-        ok: 'text-emerald-300',
-        warn: 'text-amber-300',
-        err: 'text-rose-300'
+    async function processLine(line, index) {
+      const parts = line.split('|').map(x => x.trim());
+      const payload = {
+        identifier: `ROW-${index + 1}`,
+        number: parts[0] || '',
+        month: parts[1] || '',
+        year: parts[2] || '',
+        cvv: parts[3] || ''
       };
-      const line = document.createElement('div');
-      line.className = colors[level] || colors.info;
-      line.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
-      logArea.appendChild(line);
-      logArea.scrollTop = logArea.scrollHeight;
-    }
 
-    async function copyText(value, message) {
-      try {
-        await navigator.clipboard.writeText(value);
-        appendLog(message, 'ok');
-      } catch (error) {
-        appendLog(`No se pudo copiar: ${error.message}`, 'err');
-      }
-    }
-
-
-    function clearResults() {
-      currentValid = [];
-      currentInvalid = [];
-      validTable.innerHTML = '';
-      invalidList.innerHTML = '';
-      document.getElementById('validBadge').textContent = '0';
-      document.getElementById('invalidBadge').textContent = '0';
-      document.getElementById('totalCount').textContent = '0';
-      document.getElementById('validCount').textContent = '0';
-      document.getElementById('invalidCount').textContent = '0';
-    }
-
-    function copyable(value, className = '') {
-      const show = value || '(vacío)';
-      return `<button class="font-mono hover:underline ${className}" data-copy="${value || ''}">${show}</button>`;
-    }
-
-    function renderValid(items) {
-      validTable.innerHTML = '';
-      items.forEach((item) => {
-        const row = document.createElement('tr');
-        row.className = 'border-b border-emerald-100';
-        row.innerHTML = `
-          <td class="p-2">${copyable(item.formatted, 'text-emerald-700')}</td>
-          <td class="p-2">
-            <span class="inline-flex flex-wrap gap-1">
-              <span class="px-2 py-0.5 rounded-full bg-slate-100">${item.enrichment.bank}</span>
-              <span class="px-2 py-0.5 rounded-full bg-indigo-100">${item.enrichment.brand}</span>
-              <span class="px-2 py-0.5 rounded-full bg-cyan-100">${item.enrichment.type}</span>
-            </span>
-          </td>
-        `;
-        validTable.appendChild(row);
+      const response = await fetch('/validate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
       });
+
+      const data = await response.json();
+      addRow(data);
     }
 
-    function renderInvalid(items) {
-      invalidList.innerHTML = '';
-      items.forEach((item) => {
-        const li = document.createElement('li');
-        li.className = 'p-2 rounded-lg bg-rose-50 border border-rose-100 space-y-1';
-        const label = item.formatted || item.input || item.normalized || '(sin datos)';
-        li.innerHTML = `
-          <div class="flex justify-between items-start gap-2">
-            <div>${copyable(label, 'text-rose-700')}</div>
-            <span class="text-xs px-2 py-0.5 rounded-full bg-slate-200">${item.enrichment?.source || 'none'}</span>
-          </div>
-          <div class="text-xs text-rose-700">${item.reason || 'Registro descartado'}</div>
-        `;
-        invalidList.appendChild(li);
-      });
-    }
+    document.getElementById('runBtn').addEventListener('click', async () => {
+      resultsBody.innerHTML = '';
+      const lines = document.getElementById('bulkInput').value
+        .split('\n')
+        .map(l => l.trim())
+        .filter(Boolean);
 
-    async function processBatch() {
-      const rawInput = document.getElementById('recordsInput').value;
-      const records = rawInput.split('\n').filter(v => v.trim().length);
-
-      clearResults();
-      appendLog(`Enviando ${records.length} registros`, 'info');
-      try {
-        const response = await fetch('/api/process', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ records })
-        });
-
-        const data = await response.json();
-        if (!response.ok) {
-          appendLog(data.error || 'Error de API', 'err');
-          return;
+      for (let i = 0; i < lines.length; i++) {
+        try {
+          await processLine(lines[i], i);
+        } catch (error) {
+          addRow({
+            identifier: `ROW-${i + 1}`,
+            issuer: 'UNKNOWN',
+            bank_result: `Error: ${error.message}`,
+            response_code: '-'
+          });
         }
-
-        currentValid = data.valid_results || [];
-        currentInvalid = data.invalid_results || [];
-
-        document.getElementById('totalCount').textContent = data.total;
-        document.getElementById('validCount').textContent = data.valid;
-        document.getElementById('invalidCount').textContent = data.invalid;
-        document.getElementById('cacheCount').textContent = data.cache_size ?? 0;
-        document.getElementById('validBadge').textContent = data.valid;
-        document.getElementById('invalidBadge').textContent = data.invalid;
-
-        renderValid(currentValid);
-        renderInvalid(currentInvalid);
-        appendLog(`Listo. Válidos=${data.valid} | Inválidos=${data.invalid}`, 'ok');
-      } catch (error) {
-        appendLog(`Fallo de conexión: ${error.message}`, 'err');
-      }
-    }
-
-    document.getElementById('processBtn').addEventListener('click', processBatch);
-
-    document.getElementById('copyValidBtn').addEventListener('click', async () => {
-      const text = currentValid.map(item => item.formatted).filter(Boolean).join('\n');
-      await copyText(text, `Copiados ${currentValid.length} válidos en formato NUMERO|MES|AÑO|CVV`);
-    });
-
-    document.getElementById('copyInvalidBtn').addEventListener('click', async () => {
-      const text = currentInvalid.map(item => item.formatted || item.input || item.normalized || '').filter(Boolean).join('\n');
-      await copyText(text, `Copiados ${currentInvalid.length} inválidos`);
-    });
-
-    document.addEventListener('click', async (event) => {
-      const target = event.target;
-      if (target && target.dataset && Object.prototype.hasOwnProperty.call(target.dataset, 'copy')) {
-        await copyText(target.dataset.copy, `Copiado: ${target.dataset.copy}`);
       }
     });
-
-    appendLog('WOW V7 listo para extracción estricta.', 'ok');
   </script>
 </body>
 </html>
