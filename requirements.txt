@@ -1,8 +1,4 @@
 flask>=3.0.0
 pandas>=2.2.0
-numpy>=1.26.0
-pyarrow>=15.0.0
-requests>=2.31.0
-urllib3>=2.2.0
-gunicorn>=21.2.0
 braintree>=4.27.0
+gunicorn>=21.2.0
