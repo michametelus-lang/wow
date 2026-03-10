@@ -12,6 +12,7 @@ app = Flask(__name__, template_folder="../templates")
 app.config["JSON_SORT_KEYS"] = False
 
 BIN_DB_PATH = os.getenv("BIN_DB_PATH", "templates/bin-database.csv")
+FALLBACK_BIN_DB_PATH = os.getenv("FALLBACK_BIN_DB_PATH", "templates/bin_database.csv")
 PROCESSOR_CODE_MESSAGES = {
     "2000": "Do Not Honor: el banco emisor rechazó la operación.",
     "2001": "Insufficient Funds: fondos insuficientes.",
@@ -54,8 +55,9 @@ def _normalize_month(month: str) -> str:
 
 @lru_cache(maxsize=1)
 def _load_bin_df() -> pd.DataFrame:
+    selected_path = BIN_DB_PATH if os.path.exists(BIN_DB_PATH) else FALLBACK_BIN_DB_PATH
     try:
-        df = pd.read_csv(BIN_DB_PATH, dtype=str, low_memory=False, keep_default_na=False)
+        df = pd.read_csv(selected_path, dtype=str, low_memory=False, keep_default_na=False)
     except Exception as exc:
         app.logger.warning("No se pudo cargar BIN DB local: %s", exc)
         return pd.DataFrame(columns=["bin", "bank"])
@@ -63,6 +65,8 @@ def _load_bin_df() -> pd.DataFrame:
     df.columns = [str(c).strip().lower() for c in df.columns]
     if "bin" not in df.columns:
         df["bin"] = ""
+    if "bank" not in df.columns and "issuer" in df.columns:
+        df["bank"] = df["issuer"]
     if "bank" not in df.columns:
         df["bank"] = "UNKNOWN"
 
@@ -106,6 +110,10 @@ def _extract_verification(result: Any) -> Any:
     verification = None
     if getattr(result, "credit_card", None):
         verification = getattr(result.credit_card, "verification", None)
+        if verification is None:
+            verifications = getattr(result.credit_card, "verifications", None)
+            if verifications:
+                verification = verifications[0]
     if verification is None:
         verification = getattr(result, "credit_card_verification", None)
     return verification
@@ -145,11 +153,25 @@ def diagnose_payment_method_status(card: CardPayload) -> dict[str, Any]:
 
         verification = _extract_verification(result)
         if verification is None:
+            token = getattr(getattr(result, "credit_card", None), "token", None)
+            if token:
+                verify_result = gateway.credit_card.verify(token)
+                verification = _extract_verification(verify_result)
+
+        if verification is None:
+            details = []
+            if getattr(result, "errors", None):
+                details = [err.message for err in result.errors.deep_errors]
+            message = "Sin objeto verification en respuesta de Braintree."
+            if details:
+                message = f"{message} {' | '.join(details)}"
+            elif getattr(result, "message", None):
+                message = f"{message} {result.message}"
             return {
                 "identifier": card.identifier,
                 "issuer": issuer,
                 "status": "DECLINED",
-                "bank_result": "Sin objeto verification en respuesta de Braintree.",
+                "bank_result": message,
                 "response_code": None,
                 "verification_status": None,
             }
@@ -158,7 +180,7 @@ def diagnose_payment_method_status(card: CardPayload) -> dict[str, Any]:
         response_code = getattr(verification, "processor_response_code", None)
         processor_text = getattr(verification, "processor_response_text", None)
 
-        if result.is_success and verification_status == "verified":
+        if verification_status == "verified":
             return {
                 "identifier": card.identifier,
                 "issuer": issuer,
